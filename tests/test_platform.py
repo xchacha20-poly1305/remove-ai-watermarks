@@ -64,6 +64,51 @@ class TestDeviceDetection:
         assert remover.device == "xpu"
         assert remover.torch_dtype == torch.float16
 
+    def test_load_pipeline_requests_fp16_variant_on_gpu(self):
+        """_load_pipeline pulls the fp16 weight variant on GPU so it shares
+        files with the protect-text differential pipeline instead of fetching a
+        second, full fp32 set (the re-download bug)."""
+        if not is_watermark_removal_available():
+            pytest.skip("torch/diffusers not installed")
+        from remove_ai_watermarks.noai.watermark_remover import WatermarkRemover
+
+        remover = WatermarkRemover(device="xpu")
+        with patch("remove_ai_watermarks.noai.watermark_remover.AutoImg2ImgPipeline") as fake_cls:
+            fake_cls.from_pretrained.return_value = MagicMock()
+            remover._load_pipeline()
+        fake_cls.from_pretrained.assert_called_once()
+        assert fake_cls.from_pretrained.call_args.kwargs.get("variant") == "fp16"
+
+    def test_load_pipeline_falls_back_when_no_fp16_variant(self):
+        """A model_id without an fp16 variant retries with the default weights
+        rather than erroring."""
+        if not is_watermark_removal_available():
+            pytest.skip("torch/diffusers not installed")
+        from remove_ai_watermarks.noai.watermark_remover import WatermarkRemover
+
+        remover = WatermarkRemover(device="xpu")
+        with patch("remove_ai_watermarks.noai.watermark_remover.AutoImg2ImgPipeline") as fake_cls:
+            fake_cls.from_pretrained.side_effect = [OSError("no fp16 variant"), MagicMock()]
+            remover._load_pipeline()
+        assert fake_cls.from_pretrained.call_count == 2
+        calls = fake_cls.from_pretrained.call_args_list
+        assert calls[0].kwargs.get("variant") == "fp16"
+        assert "variant" not in calls[1].kwargs
+
+    def test_load_pipeline_no_variant_on_cpu(self):
+        """CPU loads the default (fp32) weights -- no variant kwarg, so it never
+        pulls a separate file set from the differential path (also fp32 there)."""
+        if not is_watermark_removal_available():
+            pytest.skip("torch/diffusers not installed")
+        from remove_ai_watermarks.noai.watermark_remover import WatermarkRemover
+
+        remover = WatermarkRemover(device="cpu")
+        with patch("remove_ai_watermarks.noai.watermark_remover.AutoImg2ImgPipeline") as fake_cls:
+            fake_cls.from_pretrained.return_value = MagicMock()
+            remover._load_pipeline()
+        fake_cls.from_pretrained.assert_called_once()
+        assert "variant" not in fake_cls.from_pretrained.call_args.kwargs
+
     def test_seed_generator_falls_back_to_cpu_when_device_rng_unsupported(self):
         """A device with no RNG backend (e.g. some torch-xpu builds) falls back
         to a CPU generator instead of raising when --seed is used."""

@@ -266,6 +266,13 @@ _detect_model_profile_from_id = detect_model_profile
 _DIFF_PIPELINE_NAME = "pipeline_stable_diffusion_xl_differential_img2img"
 _DIFF_PIPELINE_REVISION = "0.38.0"
 
+# GPU backends load the fp16 weight *variant* (the ``.fp16.safetensors`` files).
+# Both the main img2img and the protect-text differential pipeline must agree on
+# this set, or they fetch different files from the same repo and a text vs
+# non-text image re-downloads the whole model. Distinct from the fp16 *compute
+# dtype* set (cuda/xpu only) -- MPS computes in fp32 but still loads fp16 files.
+_FP16_VARIANT_DEVICES = {"mps", "cuda", "xpu"}
+
 
 class WatermarkRemover:
     """Remove watermarks from images using diffusion model regeneration.
@@ -374,10 +381,28 @@ class WatermarkRemover:
             if self.hf_token:
                 load_kwargs["token"] = self.hf_token
 
-            self._pipeline = AutoImg2ImgPipeline.from_pretrained(  # type: ignore
-                self.model_id,
-                **load_kwargs,
-            )
+            # Prefer the fp16 variant on GPU so we share files with the
+            # protect-text differential pipeline instead of pulling a second,
+            # full fp32 set. Not every model_id ships an fp16 variant, so fall
+            # back to the default weights if it is missing.
+            use_fp16_variant = self.device in _FP16_VARIANT_DEVICES
+            if use_fp16_variant:
+                load_kwargs["variant"] = "fp16"
+
+            try:
+                self._pipeline = AutoImg2ImgPipeline.from_pretrained(  # type: ignore
+                    self.model_id,
+                    **load_kwargs,
+                )
+            except Exception:
+                if not use_fp16_variant:
+                    raise
+                self._set_progress("fp16 variant unavailable; loading default weights...")
+                load_kwargs.pop("variant", None)
+                self._pipeline = AutoImg2ImgPipeline.from_pretrained(  # type: ignore
+                    self.model_id,
+                    **load_kwargs,
+                )
 
             self._set_progress(f"Moving model to device: {self.device}")
             try:
@@ -591,7 +616,7 @@ class WatermarkRemover:
             from diffusers import DiffusionPipeline
 
             self._set_progress("Loading Differential-Diffusion pipeline (protect-text)...")
-            use_fp16 = self.device in {"mps", "cuda", "xpu"}
+            use_fp16 = self.device in _FP16_VARIANT_DEVICES
             load_kwargs: dict[str, Any] = {
                 "custom_pipeline": _DIFF_PIPELINE_NAME,
                 "custom_revision": _DIFF_PIPELINE_REVISION,
