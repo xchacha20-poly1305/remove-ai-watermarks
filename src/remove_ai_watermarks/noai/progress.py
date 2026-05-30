@@ -330,3 +330,30 @@ def make_pipeline_progress(
 def is_mps_error(error: Exception) -> bool:
     """Check whether an exception is an MPS-related runtime error."""
     return "mps" in str(error).lower()
+
+
+def is_oom_error(error: Exception) -> bool:
+    """Check whether an exception is an out-of-memory error on any GPU backend.
+
+    Covers the XPU and CUDA messages, both of which contain "out of memory"
+    (XPU raises ``torch.OutOfMemoryError`` — a ``RuntimeError`` subclass — with
+    "XPU out of memory. Tried to allocate ..."). String-based so this module
+    need not import torch.
+    """
+    return "out of memory" in str(error).lower()
+
+
+def should_fall_back_to_cpu(error: Exception, device: str) -> bool:
+    """Whether a device error warrants reloading on CPU and retrying.
+
+    - ``mps``: any MPS runtime error (unsupported ops as well as OOM) — the
+      long-standing behavior, unchanged.
+    - ``xpu``: OOM only. A non-OOM XPU fault should surface rather than
+      silently degrade to CPU and mask a real bug; OOM is the documented
+      graceful-degradation case (follow-up to the xpu backend in #24).
+    """
+    if device == "mps":
+        return is_mps_error(error)
+    if device == "xpu":
+        return is_oom_error(error)
+    return False

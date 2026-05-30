@@ -9,7 +9,7 @@ while any non-MPS error must propagate unchanged.
 
 from __future__ import annotations
 
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -21,6 +21,12 @@ from remove_ai_watermarks.noai.img2img_runner import (
 )
 
 _MPS_OOM = "MPS backend out of memory (MPS allocated: 17.21 GiB, max allowed: 20.13 GiB)"
+# The exact message a real Arc raises (torch.OutOfMemoryError, a RuntimeError
+# subclass), captured on an Intel Arc Graphics (28.55 GiB).
+_XPU_OOM = (
+    "XPU out of memory. Tried to allocate 59.61 GiB. GPU 0 has a total "
+    "capacity of 28.55 GiB of which 12.01 GiB is free."
+)
 
 
 def _result(image: object) -> Mock:
@@ -110,6 +116,78 @@ class TestMpsFallback:
         reload_on_cpu.assert_not_called()
 
 
+class TestXpuFallback:
+    """The xpu backend (#24 follow-up) shares the GPU->CPU OOM fallback, but is
+    OOM-scoped: an XPU OOM transparently retries on CPU, while a non-OOM xpu
+    fault must propagate rather than silently degrade to CPU."""
+
+    def test_xpu_oom_reloads_on_cpu_and_retries(self, monkeypatch: pytest.MonkeyPatch):
+        sentinel = object()
+        inner = Mock(side_effect=[RuntimeError(_XPU_OOM), sentinel])
+        monkeypatch.setattr(img2img_runner, "run_img2img", inner)
+        clear = Mock()
+        monkeypatch.setattr(img2img_runner, "_try_clear_device_cache", clear)
+        reload_on_cpu = Mock(return_value="cpu_pipe")
+
+        img, device = run_img2img_with_mps_fallback(
+            Mock(return_value="gpu_pipe"),
+            object(),
+            0.05,
+            50,
+            7.5,
+            "gen",
+            "xpu",
+            lambda _m: None,
+            reload_on_cpu=reload_on_cpu,
+        )
+
+        assert (img, device) == (sentinel, "cpu")
+        clear.assert_called_once_with("xpu")  # cache cleared on the right backend
+        reload_on_cpu.assert_called_once()
+        assert inner.call_count == 2
+        retry_args = inner.call_args_list[1].args
+        assert retry_args[0] == "cpu_pipe"
+        assert retry_args[5] is None  # generator dropped for deterministic CPU run
+        assert retry_args[6] == "cpu"  # device
+
+    def test_xpu_non_oom_error_propagates(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(img2img_runner, "run_img2img", Mock(side_effect=RuntimeError("XPU kernel build failed")))
+        reload_on_cpu = Mock()
+
+        with pytest.raises(RuntimeError, match="kernel build"):
+            run_img2img_with_mps_fallback(
+                Mock(return_value="gpu_pipe"),
+                object(),
+                0.05,
+                50,
+                7.5,
+                "gen",
+                "xpu",
+                lambda _m: None,
+                reload_on_cpu=reload_on_cpu,
+            )
+        reload_on_cpu.assert_not_called()
+
+
+class TestClearDeviceCache:
+    """_try_clear_device_cache routes empty_cache() to the named backend."""
+
+    def test_clears_named_backend(self, monkeypatch: pytest.MonkeyPatch):
+        import sys
+
+        fake_torch = MagicMock()
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        img2img_runner._try_clear_device_cache("xpu")
+        fake_torch.xpu.empty_cache.assert_called_once_with()
+
+    def test_missing_backend_is_noop(self, monkeypatch: pytest.MonkeyPatch):
+        import sys
+
+        fake_torch = MagicMock(spec=[])  # getattr(torch, "xpu", None) -> None
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        img2img_runner._try_clear_device_cache("xpu")  # must not raise
+
+
 class TestDifferentialMpsFallback:
     """The protect-text (Differential Diffusion) path shares the MPS->CPU
     fallback contract; mock ``run_differential`` so no torch/model is needed."""
@@ -141,6 +219,34 @@ class TestDifferentialMpsFallback:
         retry_args = inner.call_args_list[1].args
         assert retry_args[0] == "cpu_pipe"
         assert retry_args[6] is None  # generator
+        assert retry_args[7] == "cpu"  # device
+
+    def test_xpu_oom_reloads_on_cpu_and_retries(self, monkeypatch: pytest.MonkeyPatch):
+        sentinel = object()
+        inner = Mock(side_effect=[RuntimeError(_XPU_OOM), sentinel])
+        monkeypatch.setattr(img2img_runner, "run_differential", inner)
+        clear = Mock()
+        monkeypatch.setattr(img2img_runner, "_try_clear_device_cache", clear)
+        reload_on_cpu = Mock(return_value="cpu_pipe")
+
+        img, device = run_differential_with_mps_fallback(
+            load_pipeline=Mock(return_value="gpu_pipe"),
+            image=object(),
+            change_map=object(),
+            strength=0.05,
+            num_inference_steps=50,
+            guidance_scale=7.5,
+            generator="gen",
+            device="xpu",
+            set_progress=lambda _m: None,
+            reload_on_cpu=reload_on_cpu,
+        )
+
+        assert (img, device) == (sentinel, "cpu")
+        clear.assert_called_once_with("xpu")
+        reload_on_cpu.assert_called_once()
+        retry_args = inner.call_args_list[1].args
+        assert retry_args[6] is None  # generator dropped
         assert retry_args[7] == "cpu"  # device
 
     def test_happy_path_returns_original_device_without_reload(self, monkeypatch: pytest.MonkeyPatch):

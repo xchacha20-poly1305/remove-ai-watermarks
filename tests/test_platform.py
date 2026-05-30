@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from remove_ai_watermarks.noai.progress import is_mps_error
+from remove_ai_watermarks.noai.progress import is_mps_error, is_oom_error, should_fall_back_to_cpu
 from remove_ai_watermarks.noai.utils import get_image_format, is_supported_format
 from remove_ai_watermarks.noai.watermark_profiles import (
     detect_model_profile,
@@ -97,6 +97,44 @@ class TestMpsErrorDetection:
     def test_generic_error(self):
         err = RuntimeError("something went wrong")
         assert is_mps_error(err) is False
+
+
+class TestOomFallbackDecision:
+    """is_oom_error + should_fall_back_to_cpu — the xpu OOM follow-up to #24."""
+
+    # The exact message a real Arc raises: torch.OutOfMemoryError (a
+    # RuntimeError subclass), captured on an Intel Arc Graphics (28.55 GiB).
+    _XPU_OOM = (
+        "XPU out of memory. Tried to allocate 59.61 GiB. GPU 0 has a total "
+        "capacity of 28.55 GiB of which 12.01 GiB is free."
+    )
+
+    def test_is_oom_error_detects_xpu_and_cuda(self):
+        assert is_oom_error(RuntimeError(self._XPU_OOM)) is True
+        assert is_oom_error(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")) is True
+
+    def test_is_oom_error_false_for_non_oom(self):
+        assert is_oom_error(RuntimeError("Device type xpu is not supported for torch.Generator()")) is False
+
+    def test_xpu_oom_falls_back(self):
+        assert should_fall_back_to_cpu(RuntimeError(self._XPU_OOM), "xpu") is True
+
+    def test_xpu_non_oom_propagates(self):
+        # A non-OOM xpu fault must surface, not silently degrade to CPU and
+        # mask a real bug — xpu fallback is OOM-scoped by design.
+        assert should_fall_back_to_cpu(RuntimeError("XPU kernel build failed"), "xpu") is False
+
+    def test_mps_any_error_falls_back_unchanged(self):
+        # MPS keeps its broader contract: any mps-worded error triggers reload.
+        assert should_fall_back_to_cpu(RuntimeError("MPS backend out of memory"), "mps") is True
+        assert should_fall_back_to_cpu(RuntimeError("op not implemented for MPS"), "mps") is True
+
+    def test_cuda_out_of_scope(self):
+        # The auto CPU fallback covers mps + xpu only; cuda is out of scope.
+        assert should_fall_back_to_cpu(RuntimeError("CUDA out of memory"), "cuda") is False
+
+    def test_cpu_device_never_falls_back(self):
+        assert should_fall_back_to_cpu(RuntimeError(self._XPU_OOM), "cpu") is False
 
 
 # ── Model profiles ──────────────────────────────────────────────────

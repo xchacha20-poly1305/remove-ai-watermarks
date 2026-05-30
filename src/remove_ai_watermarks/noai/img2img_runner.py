@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
     from PIL import Image
 
-from remove_ai_watermarks.noai.progress import is_mps_error, make_pipeline_progress
+from remove_ai_watermarks.noai.progress import make_pipeline_progress, should_fall_back_to_cpu
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +102,10 @@ def run_img2img_with_mps_fallback(
         )
         return img, device
     except RuntimeError as error:
-        if device == "mps" and is_mps_error(error):
-            logger.warning("MPS error detected: %s. Falling back to CPU.", error)
-            set_progress("MPS error! Clearing cache and retrying on CPU...")
-            _try_clear_mps_cache()
+        if should_fall_back_to_cpu(error, device):
+            logger.warning("%s error detected: %s. Falling back to CPU.", device.upper(), error)
+            set_progress(f"{device.upper()} error! Clearing cache and retrying on CPU...")
+            _try_clear_device_cache(device)
             pipeline = reload_on_cpu()
             img = run_img2img(
                 pipeline,
@@ -191,10 +191,10 @@ def run_differential_with_mps_fallback(
         )
         return img, device
     except RuntimeError as error:
-        if device == "mps" and is_mps_error(error):
-            logger.warning("MPS error detected: %s. Falling back to CPU.", error)
-            set_progress("MPS error! Clearing cache and retrying on CPU...")
-            _try_clear_mps_cache()
+        if should_fall_back_to_cpu(error, device):
+            logger.warning("%s error detected: %s. Falling back to CPU.", device.upper(), error)
+            set_progress(f"{device.upper()} error! Clearing cache and retrying on CPU...")
+            _try_clear_device_cache(device)
             pipeline = reload_on_cpu()
             img = run_differential(
                 pipeline,
@@ -234,9 +234,11 @@ def _call_pipeline(
     return pipeline(**kwargs)
 
 
-def _try_clear_mps_cache() -> None:
+def _try_clear_device_cache(device: str) -> None:
+    """Best-effort ``empty_cache()`` on the active GPU backend (mps/xpu/cuda)."""
     with contextlib.suppress(Exception):
         import torch
 
-        if hasattr(torch, "mps"):
-            torch.mps.empty_cache()  # type: ignore[attr-defined]
+        backend = getattr(torch, device, None)  # torch.mps / torch.xpu / torch.cuda
+        if backend is not None and hasattr(backend, "empty_cache"):
+            backend.empty_cache()

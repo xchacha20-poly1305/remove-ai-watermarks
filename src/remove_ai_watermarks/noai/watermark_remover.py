@@ -682,7 +682,7 @@ class WatermarkRemover:
     ) -> Image.Image:
         """Run CtrlRegen pipeline with MPS fallback."""
         from remove_ai_watermarks.noai.ctrlregen import is_ctrlregen_available
-        from remove_ai_watermarks.noai.progress import is_mps_error
+        from remove_ai_watermarks.noai.progress import should_fall_back_to_cpu
 
         if not is_ctrlregen_available():
             missing_pkgs = ["controlnet-aux", "color-matcher", "safetensors"]
@@ -709,12 +709,13 @@ class WatermarkRemover:
                 seed=seed,
             )
         except RuntimeError as error:
-            if self.device == "mps" and is_mps_error(error):
-                logger.warning("MPS out of memory during CtrlRegen. Falling back to CPU.")
-                self._set_progress("MPS out of memory! Retrying CtrlRegen on CPU...")
+            if should_fall_back_to_cpu(error, self.device):
+                logger.warning("%s error during CtrlRegen. Falling back to CPU.", self.device.upper())
+                self._set_progress(f"{self.device.upper()} error! Retrying CtrlRegen on CPU...")
                 with contextlib.suppress(Exception):
-                    if _HAS_TORCH and hasattr(torch, "mps"):
-                        torch.mps.empty_cache()  # type: ignore[attr-defined]
+                    backend = getattr(torch, self.device, None) if _HAS_TORCH else None
+                    if backend is not None and hasattr(backend, "empty_cache"):
+                        backend.empty_cache()  # type: ignore[attr-defined]
 
                 self.device = "cpu"
                 self.torch_dtype = torch.float32  # type: ignore[assignment]
